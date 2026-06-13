@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Optimaliseringer
- * Description: Bildekomprimering (WebP), sikkerhets- og ytelsesoptimaliseringer for WordPress.
- * Version:     1.2.0
+ * Description: Bildekomprimering (AVIF/WebP), sikkerhets- og ytelsesoptimaliseringer for WordPress.
+ * Version:     1.3.0
  * Author:      Yngve Stein
  * Update URI:  https://github.com/yngvestein/optimaliseringer/
  */
@@ -24,7 +24,7 @@ $optim_updater = PucFactory::buildUpdateChecker(
 $optim_updater->setBranch('main');
 
 // -------------------------------------------------------------------------
-// 1. Bilder → WebP + maks 1920 px
+// 1. Bilder → AVIF (med WebP-fallback) + maks 1920 px
 // -------------------------------------------------------------------------
 
 add_filter('wp_handle_upload', 'optim_handle_uploaded_image');
@@ -32,11 +32,7 @@ add_filter('wp_handle_upload', 'optim_handle_uploaded_image');
 function optim_handle_uploaded_image(array $upload): array {
     $convertible = ['image/jpeg', 'image/png', 'image/gif'];
 
-    if (
-        !in_array($upload['type'], $convertible, true)
-        || !function_exists('imagewebp')
-        || !(imagetypes() & IMG_WEBP)
-    ) {
+    if (!in_array($upload['type'], $convertible, true)) {
         return $upload;
     }
 
@@ -53,24 +49,38 @@ function optim_handle_uploaded_image(array $upload): array {
 
     $image = optim_maybe_resize($image, $upload['type'], 1920);
 
-    $webp_file = preg_replace('/\.[^.]+$/', '.webp', $file);
+    $result = optim_save_modern_format($image, $file);
+    imagedestroy($image);
 
-    if (!imagewebp($image, $webp_file, 82)) {
-        imagedestroy($image);
+    if (!$result) {
         return $upload;
     }
 
-    imagedestroy($image);
-
-    if ($webp_file !== $file) {
+    if ($result['file'] !== $file) {
         @unlink($file);
     }
 
     return array_merge($upload, [
-        'file' => $webp_file,
-        'url'  => preg_replace('/\.[^.]+$/', '.webp', $upload['url']),
-        'type' => 'image/webp',
+        'file' => $result['file'],
+        'url'  => preg_replace('/\.[^.]+$/', '.' . pathinfo($result['file'], PATHINFO_EXTENSION), $upload['url']),
+        'type' => $result['type'],
     ]);
+}
+
+function optim_save_modern_format($image, string $file): ?array {
+    if (function_exists('imageavif') && (imagetypes() & IMG_AVIF)) {
+        $out = preg_replace('/\.[^.]+$/', '.avif', $file);
+        if (@imageavif($image, $out, 60, 6)) {
+            return ['file' => $out, 'type' => 'image/avif'];
+        }
+    }
+    if (function_exists('imagewebp') && (imagetypes() & IMG_WEBP)) {
+        $out = preg_replace('/\.[^.]+$/', '.webp', $file);
+        if (@imagewebp($image, $out, 82)) {
+            return ['file' => $out, 'type' => 'image/webp'];
+        }
+    }
+    return null;
 }
 
 function optim_load_image(string $path, string $type) {
