@@ -2,12 +2,18 @@
 /**
  * Plugin Name: Optimaliseringer
  * Description: Bildekomprimering (AVIF/WebP), sikkerhets- og ytelsesoptimaliseringer for WordPress.
- * Version:     1.3.0
+ * Version:     1.4.0
  * Author:      Yngve Stein
  * Update URI:  https://github.com/yngvestein/optimaliseringer/
  */
 
 defined('ABSPATH') || exit;
+
+// Deaktiver fil-redigering i admin (tema-/plugin-editor) – hindrer kjøring
+// av vilkårlig kode dersom en admin-konto kompromitteres.
+if (!defined('DISALLOW_FILE_EDIT')) {
+    define('DISALLOW_FILE_EDIT', true);
+}
 
 // -------------------------------------------------------------------------
 // Auto-oppdatering fra GitHub
@@ -211,3 +217,24 @@ function optim_remove_pingback_header(array $headers): array {
 // -------------------------------------------------------------------------
 
 add_filter('wp_revisions_to_keep', fn($num, $post) => 5, 10, 2);
+
+// -------------------------------------------------------------------------
+// 7. Sikkerhets-headers (frontend)
+// -------------------------------------------------------------------------
+// Trygge headers som ikke bryter sidebyggere/eksterne skript. Bevisst UTEN
+// Content-Security-Policy (krever per-side-tilpasning) og UTEN
+// includeSubDomains på HSTS (subdomener kan ha self-signed sertifikat).
+
+add_action('send_headers', 'optim_security_headers');
+
+function optim_security_headers(): void {
+    if (is_admin()) {
+        return;
+    }
+    header('X-Content-Type-Options: nosniff');
+    header('X-Frame-Options: SAMEORIGIN');
+    header('Referrer-Policy: strict-origin-when-cross-origin');
+    if (is_ssl()) {
+        header('Strict-Transport-Security: max-age=31536000');
+    }
+}

@@ -4,7 +4,7 @@ Tags: performance, images, avif, webp, security
 Requires at least: 6.0
 Tested up to: 7.0
 Requires PHP: 8.1
-Stable tag: 1.3.0
+Stable tag: 1.4.0
 License: GPLv2 or later
 
 Bildekomprimering (AVIF/WebP), sikkerhets- og ytelsesoptimaliseringer for WordPress.
@@ -14,6 +14,10 @@ Bildekomprimering (AVIF/WebP), sikkerhets- og ytelsesoptimaliseringer for WordPr
 Konverterer opplastede bilder til AVIF (med WebP-fallback) og skalerer ned til maks 1920 px. Inkluderer sikkerhets- og ytelsestiltak som deaktivering av XML-RPC, emoji-scripts og unødvendige head-tags, SVG-opplasting for administratorer, og begrensning av post-revisjoner.
 
 == Changelog ==
+
+= 1.4.0 =
+* Ny: Sikkerhets-headers (X-Content-Type-Options, X-Frame-Options, Referrer-Policy, HSTS over HTTPS)
+* Ny: Deaktiverer fil-redigering i admin (DISALLOW_FILE_EDIT)
 
 = 1.3.0 =
 * Ny: AVIF-konvertering med WebP-fallback (AVIF gir 20–50 % mindre filer enn WebP)
