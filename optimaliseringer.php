@@ -2,7 +2,8 @@
 /**
  * Plugin Name: Optimaliseringer
  * Description: Bildekomprimering (AVIF/WebP), sikkerhets- og ytelsesoptimaliseringer for WordPress.
- * Version:     1.4.0
+ * Version:     1.5.0
+ * Requires at least: 7.0
  * Author:      Yngve Stein
  * Update URI:  https://github.com/yngvestein/optimaliseringer/
  */
@@ -30,7 +31,8 @@ $optim_updater = PucFactory::buildUpdateChecker(
 $optim_updater->setBranch('main');
 
 // -------------------------------------------------------------------------
-// 1. Bilder → AVIF (med WebP-fallback) + maks 1920 px
+// 1. Bildekomprimering: konverter til AVIF/WebP + skaler ned ved opplasting
+//    Format og maks. dimensjon styres fra Innstillinger → Media.
 // -------------------------------------------------------------------------
 
 add_filter('wp_handle_upload', 'optim_handle_uploaded_image');
@@ -53,7 +55,7 @@ function optim_handle_uploaded_image(array $upload): array {
         return $upload;
     }
 
-    $image = optim_maybe_resize($image, $upload['type'], 1920);
+    $image = optim_maybe_resize($image, $upload['type'], (int) get_option('optim_max_dimension', 1920));
 
     $result = optim_save_modern_format($image, $file);
     imagedestroy($image);
@@ -74,18 +76,23 @@ function optim_handle_uploaded_image(array $upload): array {
 }
 
 function optim_save_modern_format($image, string $file): ?array {
-    if (function_exists('imageavif') && (imagetypes() & IMG_AVIF)) {
+    $format = get_option('optim_image_format', 'avif');
+
+    if ($format === 'avif' && function_exists('imageavif') && (imagetypes() & IMG_AVIF)) {
         $out = preg_replace('/\.[^.]+$/', '.avif', $file);
         if (@imageavif($image, $out, 60, 6)) {
             return ['file' => $out, 'type' => 'image/avif'];
         }
+        // Server støtter ikke AVIF – fall tilbake til WebP
     }
+
     if (function_exists('imagewebp') && (imagetypes() & IMG_WEBP)) {
         $out = preg_replace('/\.[^.]+$/', '.webp', $file);
         if (@imagewebp($image, $out, 82)) {
             return ['file' => $out, 'type' => 'image/webp'];
         }
     }
+
     return null;
 }
 
@@ -237,4 +244,305 @@ function optim_security_headers(): void {
     if (is_ssl()) {
         header('Strict-Transport-Security: max-age=31536000');
     }
+}
+
+// -------------------------------------------------------------------------
+// 8. Automatisk alt-tekst ved bildeopplasting (krever WP 7.0+)
+//    Steg 1: filnavn → lesbar alt-tekst (synkront, umiddelbart)
+//    Steg 2: WP AI Client analyserer bildet i bakgrunnen (WP-Cron)
+//            for bilder med svake filnavn (kamera-IDer, stockfoto, etc.)
+// -------------------------------------------------------------------------
+
+add_action('add_attachment',        'optim_auto_alt_on_upload');
+add_action('optim_gemini_alt',      'optim_ai_analyze_and_set', 10, 1);
+add_action('wp_ajax_optim_bulk_alt','optim_ajax_bulk_alt');
+
+function optim_auto_alt_on_upload(int $attachment_id): void {
+    if (!wp_attachment_is_image($attachment_id)) {
+        return;
+    }
+    if (get_post_meta($attachment_id, '_wp_attachment_image_alt', true) !== '') {
+        return;
+    }
+
+    $filename = pathinfo(get_attached_file($attachment_id), PATHINFO_FILENAME);
+    $alt      = optim_alt_from_filename($filename);
+
+    if ($alt !== '') {
+        update_post_meta($attachment_id, '_wp_attachment_image_alt', $alt);
+    }
+
+    if (optim_filename_is_weak($filename)) {
+        wp_schedule_single_event(time(), 'optim_gemini_alt', [$attachment_id]);
+    }
+}
+
+/**
+ * Renser filnavn til lesbar alt-tekst.
+ * Returnerer tom streng om resultatet ikke er meningsfullt.
+ */
+function optim_alt_from_filename(string $filename): string {
+    // Fjern WordPress-suffiks som -scaled, -e{timestamp}, -NNNxNNN, -rotated
+    $clean = preg_replace('/-e\d{10,}/', '', $filename);
+    $clean = preg_replace('/-\d+x\d+$/', '', $clean);
+    $clean = preg_replace('/-(scaled|rotated|copy)$/i', '', $clean);
+
+    // Erstatt skilletegn med mellomrom
+    $clean = str_replace(['_', '-'], ' ', $clean);
+    $clean = preg_replace('/\s+/', ' ', trim($clean));
+
+    // Filtrer ut rene tallord (kamera-IDer, tidsstempler)
+    $words = array_filter(explode(' ', $clean), fn($w) => !preg_match('/^\d+$/', $w) && strlen($w) > 0);
+
+    if (count($words) < 1) {
+        return '';
+    }
+
+    $alt = implode(' ', $words);
+    return mb_strtoupper(mb_substr($alt, 0, 1)) . mb_substr($alt, 1);
+}
+
+/**
+ * Returnerer true om filnavnet ikke gir nok kontekst for en god alt-tekst.
+ * Disse bildene egner seg for Gemini-analyse.
+ */
+function optim_filename_is_weak(string $filename): bool {
+    $lower = strtolower($filename);
+
+    // Stockfoto-IDer
+    if (preg_match('/^(adobestock|shutterstock|istock|gettyimages|dreamstime)[_-]/', $lower)) {
+        return true;
+    }
+
+    // Kamera-filnavn: IMG_1234, DSC_0001, DSCN1234, P1234567, 20240315_143022
+    if (preg_match('/^(img|dsc|dscn|p|photo|pic|image)[_-]?\d+/i', $lower)) {
+        return true;
+    }
+
+    // Rene UUID-er eller hash-er
+    if (preg_match('/^[a-f0-9]{8,}(-[a-f0-9]+)*$/i', $lower)) {
+        return true;
+    }
+
+    // Svært korte filnavn (1 meningsfylt ord etter rensing)
+    $alt = optim_alt_from_filename($filename);
+    $words = array_filter(explode(' ', $alt), fn($w) => strlen($w) > 2);
+    if (count($words) <= 1) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Kjøres av WP-Cron i bakgrunnen.
+ * Bruker WordPress 7.0 AI Client — leverandør konfigureres under Innstillinger → Connectors.
+ */
+function optim_ai_analyze_and_set(int $attachment_id): void {
+    $file = get_attached_file($attachment_id);
+    if (!$file || !file_exists($file)) {
+        return;
+    }
+
+    $mime      = get_post_mime_type($attachment_id);
+    $supported = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/avif'];
+    if (!in_array($mime, $supported, true)) {
+        return;
+    }
+
+    $locale   = get_locale();
+    $norwegian = str_starts_with($locale, 'nb') || str_starts_with($locale, 'nn');
+    $prompt   = $norwegian
+        ? 'Generer en kort, beskrivende alt-tekst for dette bildet på norsk. Maks 10 ord. Kun alt-teksten, ingen forklaring eller tegnsetting på slutten.'
+        : 'Generate a short, descriptive alt text for this image. Maximum 10 words. Only the alt text, no explanation or trailing punctuation.';
+
+    try {
+        $file_dto = new \WordPress\AiClient\Files\DTO\File([
+            'data'      => base64_encode(file_get_contents($file)),
+            'mime_type' => $mime,
+        ]);
+
+        $result = wp_ai_client_prompt()
+            ->with_text($prompt)
+            ->with_file($file_dto)
+            ->using_max_tokens(60)
+            ->using_temperature(0.2)
+            ->generate_text();
+
+        if (!is_wp_error($result)) {
+            $alt = trim((string) $result, " \t\n\r\0\x0B.\"'");
+            if ($alt !== '') {
+                update_post_meta($attachment_id, '_wp_attachment_image_alt', sanitize_text_field($alt));
+            }
+        }
+    } catch (\Throwable $e) {
+        // Ingen connector konfigurert — filnavn-alt-tekst gjelder
+    }
+}
+
+function optim_ajax_bulk_alt(): void {
+    check_ajax_referer('optim_bulk_alt');
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error('Ingen tilgang.');
+    }
+
+    global $wpdb;
+    $ids = $wpdb->get_col(
+        "SELECT p.ID FROM {$wpdb->posts} p
+         LEFT JOIN {$wpdb->postmeta} pm
+           ON pm.post_id = p.ID AND pm.meta_key = '_wp_attachment_image_alt'
+         WHERE p.post_type = 'attachment'
+           AND p.post_mime_type LIKE 'image/%'
+           AND (pm.meta_value IS NULL OR pm.meta_value = '')
+         ORDER BY p.ID DESC"
+    );
+
+    $done_sync = 0;
+    $queued_ai = 0;
+
+    foreach ($ids as $id) {
+        $id       = (int) $id;
+        $filename = pathinfo(get_attached_file($id), PATHINFO_FILENAME);
+        $alt      = optim_alt_from_filename($filename);
+
+        if ($alt !== '') {
+            update_post_meta($id, '_wp_attachment_image_alt', $alt);
+            $done_sync++;
+        }
+
+        if (optim_filename_is_weak($filename)) {
+            wp_schedule_single_event(time(), 'optim_gemini_alt', [$id]);
+            $queued_ai++;
+        }
+    }
+
+    $msg = sprintf('%d bilder oppdatert fra filnavn', $done_sync);
+    if ($queued_ai > 0) {
+        $msg .= sprintf(', %d satt i kø for AI-analyse.', $queued_ai);
+    } else {
+        $msg .= '.';
+    }
+
+    wp_send_json_success(['message' => $msg, 'total' => count($ids)]);
+}
+
+// -------------------------------------------------------------------------
+// 9. Innstillinger → Media: komprimering og bulk alt-tekst
+// -------------------------------------------------------------------------
+
+add_action('admin_init', 'optim_register_media_settings');
+
+function optim_register_media_settings(): void {
+    register_setting('media', 'optim_max_dimension', [
+        'type'              => 'integer',
+        'default'           => 1920,
+        'sanitize_callback' => fn($v) => max(400, min(8000, (int) $v)),
+    ]);
+    register_setting('media', 'optim_image_format', [
+        'type'              => 'string',
+        'default'           => 'avif',
+        'sanitize_callback' => fn($v) => in_array($v, ['avif', 'webp'], true) ? $v : 'avif',
+    ]);
+
+    add_settings_section('optim_compression', 'Bildekomprimering', '__return_false', 'media');
+
+    add_settings_field(
+        'optim_max_dimension', 'Maks bildestørrelse',
+        'optim_field_max_dimension', 'media', 'optim_compression'
+    );
+    add_settings_field(
+        'optim_image_format', 'Utdataformat',
+        'optim_field_image_format', 'media', 'optim_compression'
+    );
+
+    add_settings_section('optim_alt_bulk', 'Alt-tekst for mediebibliotek', '__return_false', 'media');
+
+    add_settings_field(
+        'optim_bulk_alt_field', 'Bilder uten alt-tekst',
+        'optim_field_bulk_alt', 'media', 'optim_alt_bulk'
+    );
+}
+
+function optim_field_max_dimension(): void {
+    $val = (int) get_option('optim_max_dimension', 1920);
+    printf(
+        '<input type="number" name="optim_max_dimension" id="optim_max_dimension"
+                value="%d" min="400" max="8000" step="10" class="small-text" /> px
+         <p class="description">Bilder som er bredere eller høyere enn dette skaleres ned ved opplasting.</p>',
+        $val
+    );
+}
+
+function optim_field_image_format(): void {
+    $format = get_option('optim_image_format', 'avif');
+    foreach (['avif' => 'AVIF (anbefalt)', 'webp' => 'WebP'] as $value => $label) {
+        printf(
+            '<label style="margin-right:1.5em"><input type="radio" name="optim_image_format"
+                    value="%s" %s /> %s</label>',
+            esc_attr($value),
+            checked($format, $value, false),
+            esc_html($label)
+        );
+    }
+    echo '<p class="description">Alle opplastede JPEG-, PNG- og GIF-bilder konverteres alltid til valgt format.</p>';
+}
+
+function optim_field_bulk_alt(): void {
+    global $wpdb;
+    $count = (int) $wpdb->get_var(
+        "SELECT COUNT(*) FROM {$wpdb->posts} p
+         LEFT JOIN {$wpdb->postmeta} pm
+           ON pm.post_id = p.ID AND pm.meta_key = '_wp_attachment_image_alt'
+         WHERE p.post_type = 'attachment'
+           AND p.post_mime_type LIKE 'image/%'
+           AND (pm.meta_value IS NULL OR pm.meta_value = '')"
+    );
+
+    if ($count === 0) {
+        echo '<span style="color:#00a32a">&#10003; Alle bilder har alt-tekst.</span>';
+        return;
+    }
+
+    printf(
+        '<p style="margin:0 0 .6em">%d bilder mangler alt-tekst.</p>
+         <button type="button" id="optim-bulk-btn" class="button" data-nonce="%s">
+             Generer alt-tekst for alle
+         </button>
+         <span id="optim-bulk-status" style="margin-left:.75em;color:#646970"></span>',
+        $count,
+        esc_attr(wp_create_nonce('optim_bulk_alt'))
+    );
+    ?>
+    <script>
+    document.getElementById('optim-bulk-btn').addEventListener('click', function () {
+        const btn    = this;
+        const status = document.getElementById('optim-bulk-status');
+        btn.disabled = true;
+        status.style.color = '#646970';
+        status.textContent = 'Arbeider…';
+
+        fetch(ajaxurl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ action: 'optim_bulk_alt', _ajax_nonce: btn.dataset.nonce })
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) {
+                status.style.color = '#00a32a';
+                status.textContent = '✓ ' + data.data.message;
+            } else {
+                status.style.color = '#d63638';
+                status.textContent = 'Feil: ' + (data.data || 'Ukjent feil');
+                btn.disabled = false;
+            }
+        })
+        .catch(() => {
+            status.style.color = '#d63638';
+            status.textContent = 'Tilkoblingsfeil.';
+            btn.disabled = false;
+        });
+    });
+    </script>
+    <?php
 }
