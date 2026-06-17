@@ -253,9 +253,10 @@ function optim_security_headers(): void {
 //            for bilder med svake filnavn (kamera-IDer, stockfoto, etc.)
 // -------------------------------------------------------------------------
 
-add_action('add_attachment',        'optim_auto_alt_on_upload');
-add_action('optim_gemini_alt',      'optim_ai_analyze_and_set', 10, 1);
-add_action('wp_ajax_optim_bulk_alt','optim_ajax_bulk_alt');
+add_action('add_attachment',              'optim_auto_alt_on_upload');
+add_action('optim_gemini_alt',           'optim_ai_analyze_and_set', 10, 1);
+add_action('wp_ajax_optim_bulk_alt',     'optim_ajax_bulk_alt');
+add_action('wp_ajax_optim_poll_ai_prog', 'optim_ajax_poll_ai_prog');
 
 function optim_auto_alt_on_upload(int $attachment_id): void {
     if (!wp_attachment_is_image($attachment_id)) {
@@ -273,6 +274,7 @@ function optim_auto_alt_on_upload(int $attachment_id): void {
     }
 
     if (optim_filename_is_weak($filename)) {
+        update_post_meta($attachment_id, '_optim_ai_pending', '1');
         wp_schedule_single_event(time(), 'optim_gemini_alt', [$attachment_id]);
     }
 }
@@ -377,6 +379,8 @@ function optim_ai_analyze_and_set(int $attachment_id): void {
         }
     } catch (\Throwable $e) {
         // Ingen connector konfigurert — filnavn-alt-tekst gjelder
+    } finally {
+        delete_post_meta($attachment_id, '_optim_ai_pending');
     }
 }
 
@@ -387,6 +391,10 @@ function optim_ajax_bulk_alt(): void {
     }
 
     global $wpdb;
+
+    // Rydd opp eventuelle hengede pending-flagg fra avbrutte kjøringer
+    $wpdb->query("DELETE FROM {$wpdb->postmeta} WHERE meta_key = '_optim_ai_pending'");
+
     $ids = $wpdb->get_col(
         "SELECT p.ID FROM {$wpdb->posts} p
          LEFT JOIN {$wpdb->postmeta} pm
@@ -411,6 +419,7 @@ function optim_ajax_bulk_alt(): void {
         }
 
         if (optim_filename_is_weak($filename)) {
+            update_post_meta($id, '_optim_ai_pending', '1');
             wp_schedule_single_event(time(), 'optim_gemini_alt', [$id]);
             $queued_ai++;
         }
@@ -418,12 +427,26 @@ function optim_ajax_bulk_alt(): void {
 
     $msg = sprintf('%d bilder oppdatert fra filnavn', $done_sync);
     if ($queued_ai > 0) {
-        $msg .= sprintf(', %d satt i kø for AI-analyse.', $queued_ai);
+        $msg .= sprintf(', %d satt i kø for AI-analyse', $queued_ai);
     } else {
         $msg .= '.';
     }
 
-    wp_send_json_success(['message' => $msg, 'total' => count($ids)]);
+    wp_send_json_success(['message' => $msg, 'total' => count($ids), 'queued_ai' => $queued_ai]);
+}
+
+function optim_ajax_poll_ai_prog(): void {
+    check_ajax_referer('optim_bulk_alt');
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error();
+    }
+
+    global $wpdb;
+    $remaining = (int) $wpdb->get_var(
+        "SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key = '_optim_ai_pending'"
+    );
+
+    wp_send_json_success(['remaining' => $remaining]);
 }
 
 // -------------------------------------------------------------------------
@@ -505,44 +528,147 @@ function optim_field_bulk_alt(): void {
 
     printf(
         '<p style="margin:0 0 .6em">%d bilder mangler alt-tekst.</p>
-         <button type="button" id="optim-bulk-btn" class="button" data-nonce="%s">
+         <button type="button" id="optim-bulk-btn" class="button button-primary" data-nonce="%s">
              Generer alt-tekst for alle
-         </button>
-         <span id="optim-bulk-status" style="margin-left:.75em;color:#646970"></span>',
+         </button>',
         $count,
         esc_attr(wp_create_nonce('optim_bulk_alt'))
     );
     ?>
+    <div id="optim-bulk-wrap" style="margin-top:10px;max-width:420px;display:none">
+        <div style="background:#f0f0f1;border-radius:100px;height:8px;overflow:hidden">
+            <div id="optim-bar-fill" style="
+                height:100%;width:4%;
+                background:linear-gradient(90deg,#2271b1 0%,#72aee6 50%,#2271b1 100%);
+                background-size:200% 100%;
+                border-radius:100px;
+                transition:width .5s ease;
+            "></div>
+        </div>
+        <p id="optim-bar-msg" style="margin:.5em 0 0;color:#646970;font-size:13px;font-style:italic"></p>
+    </div>
+    <p id="optim-bulk-done" style="display:none;color:#00a32a;font-weight:600;margin-top:8px"></p>
+    <style>
+    #optim-bar-fill { animation: optim-shimmer 1.8s linear infinite; }
+    @keyframes optim-shimmer {
+        from { background-position: 200% 0; }
+        to   { background-position: -200% 0; }
+    }
+    </style>
     <script>
-    document.getElementById('optim-bulk-btn').addEventListener('click', function () {
-        const btn    = this;
-        const status = document.getElementById('optim-bulk-status');
-        btn.disabled = true;
-        status.style.color = '#646970';
-        status.textContent = 'Arbeider…';
+    (function () {
+        const msgs = [
+            'Viser bildet til AI-en og venter spent…',
+            'Nevrale nettverk surrer behagelig…',
+            'Forsøker å ikke hallusinere…',
+            'Ansvarsfull AI™ tenker hardt…',
+            'Omgjør piksler til presise ord…',
+            'Spør skyene snilt om hjelp…',
+            'Henter frem sin indre poet…',
+            'Teller farger med matematisk nøyaktighet…',
+            'Omgjør bildets sjel til maks. 10 ord…',
+            'Litt til — AI er grundig…',
+        ];
 
-        fetch(ajaxurl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({ action: 'optim_bulk_alt', _ajax_nonce: btn.dataset.nonce })
-        })
-        .then(r => r.json())
-        .then(data => {
-            if (data.success) {
-                status.style.color = '#00a32a';
-                status.textContent = '✓ ' + data.data.message;
-            } else {
-                status.style.color = '#d63638';
-                status.textContent = 'Feil: ' + (data.data || 'Ukjent feil');
+        document.getElementById('optim-bulk-btn').addEventListener('click', function () {
+            const btn   = this;
+            const wrap  = document.getElementById('optim-bulk-wrap');
+            const fill  = document.getElementById('optim-bar-fill');
+            const msg   = document.getElementById('optim-bar-msg');
+            const done  = document.getElementById('optim-bulk-done');
+            const nonce = btn.dataset.nonce;
+
+            btn.disabled = true;
+            wrap.style.display = 'block';
+            msg.textContent    = 'Oppdaterer fra filnavn…';
+            fill.style.width   = '4%';
+
+            fetch(ajaxurl, {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body:    new URLSearchParams({ action: 'optim_bulk_alt', _ajax_nonce: nonce }),
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (!data.success) {
+                    wrap.style.display = 'none';
+                    done.style.color   = '#d63638';
+                    done.style.display = 'block';
+                    done.textContent   = '✗ ' + (data.data || 'Ukjent feil');
+                    btn.disabled = false;
+                    return;
+                }
+
+                const aiQueued = data.data.queued_ai || 0;
+
+                if (aiQueued === 0) {
+                    wrap.style.display = 'none';
+                    done.style.display = 'block';
+                    done.textContent   = '✓ ' + data.data.message;
+                    return;
+                }
+
+                // Filnavn er ferdig – vis AI-fremdrift
+                msg.textContent  = msgs[0];
+                fill.style.width = '8%';
+
+                let msgIdx  = 0;
+                let elapsed = 0;
+                const maxWait = 120; // sekunder
+
+                const msgTimer = setInterval(() => {
+                    msgIdx = (msgIdx + 1) % msgs.length;
+                    msg.textContent = msgs[msgIdx];
+                }, 2200);
+
+                const pollTimer = setInterval(() => {
+                    elapsed += 2;
+
+                    if (elapsed >= maxWait) {
+                        clearInterval(pollTimer);
+                        clearInterval(msgTimer);
+                        wrap.style.display = 'none';
+                        done.style.color   = '#646970';
+                        done.style.display = 'block';
+                        done.textContent   = '⏱ ' + data.data.message + '. AI-analysen kjøres automatisk i bakgrunnen.';
+                        return;
+                    }
+
+                    fetch(ajaxurl, {
+                        method:  'POST',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body:    new URLSearchParams({ action: 'optim_poll_ai_prog', _ajax_nonce: nonce }),
+                    })
+                    .then(r => r.json())
+                    .then(d => {
+                        if (!d.success) return;
+                        const remaining = d.data.remaining;
+                        const pct = Math.round(((aiQueued - remaining) / aiQueued) * 100);
+                        fill.style.width = Math.min(96, Math.max(8, pct)) + '%';
+
+                        if (remaining === 0) {
+                            clearInterval(pollTimer);
+                            clearInterval(msgTimer);
+                            fill.style.width = '100%';
+                            setTimeout(() => {
+                                wrap.style.display = 'none';
+                                done.style.display = 'block';
+                                done.textContent   = '✓ ' + data.data.message + ' — ' + aiQueued + ' analysert av AI. Bra jobba, begge to!';
+                            }, 600);
+                        }
+                    })
+                    .catch(() => {});
+                }, 2000);
+            })
+            .catch(() => {
+                wrap.style.display = 'none';
+                done.style.color   = '#d63638';
+                done.style.display = 'block';
+                done.textContent   = '✗ Tilkoblingsfeil.';
                 btn.disabled = false;
-            }
-        })
-        .catch(() => {
-            status.style.color = '#d63638';
-            status.textContent = 'Tilkoblingsfeil.';
-            btn.disabled = false;
+            });
         });
-    });
+    }());
     </script>
     <?php
 }
