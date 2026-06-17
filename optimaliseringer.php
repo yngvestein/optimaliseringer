@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Optimaliseringer
  * Description: Bildekomprimering (AVIF/WebP), sikkerhets- og ytelsesoptimaliseringer for WordPress.
- * Version:     1.5.0
+ * Version:     1.5.1
  * Requires at least: 7.0
  * Author:      Yngve Stein
  * Update URI:  https://github.com/yngvestein/optimaliseringer/
